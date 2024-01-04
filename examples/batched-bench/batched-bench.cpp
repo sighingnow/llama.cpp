@@ -32,7 +32,7 @@ int main(int argc, char ** argv) {
     gpt_params params;
 
     if (argc == 1 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [N_KV_MAX] [IS_PP_SHARED] [NGL] [MMQ] <PP> <TG> <PL>\n" , argv[0]);
+        printf("usage: %s MODEL_PATH [N_KV_MAX] [IS_PP_SHARED] [NGL] [MMQ] <PP> <TG> <PL> <N_SELECTIVE> <LOOKAHEAD> <ACCEPT>\n" , argv[0]);
         printf("  <PP>, <TG> and PL are comma-separated lists of numbers without spaces\n\n");
         printf("  example: %s ggml-model-f16.gguf 2048 0 999 0 128,256,512 128,256 1,2,4,8,16,32\n\n", argv[0]);
         return 1 ;
@@ -47,6 +47,10 @@ int main(int argc, char ** argv) {
     std::vector<int> n_tg = { 128, 256, };
     std::vector<int> n_pl = { 1, 2, 4, 8, 16, 32, };
     //std::vector<int> n_pl = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, };
+
+    int n_selective_layers = 0;
+    int lookahead = 1;
+    int accept    = 1;
 
     if (argc >= 2) {
         params.model = argv[1];
@@ -78,6 +82,20 @@ int main(int argc, char ** argv) {
 
     if (argc >= 9) {
         n_pl = parse_list(argv[8]);
+    }
+
+    if (argc >= 10) {
+        n_selective_layers = std::atoi(argv[9]);
+    }
+
+    if (argc >= 11) {
+        lookahead = std::atoi(argv[10]);
+    }
+
+    if (argc >= 12) {
+        accept = std::atoi(argv[11]);
+    } else {
+        accept = lookahead;
     }
 
     // init LLM
@@ -122,6 +140,7 @@ int main(int argc, char ** argv) {
 
     // decode in batches of ctx_params.n_batch tokens
     auto decode_helper = [](llama_context * ctx, llama_batch & batch, int32_t n_batch) {
+        // LOG_TEE("%s: n_tokens = %d, n_batch = %d\n", __func__, batch.n_tokens, n_batch);
         for (int32_t i = 0; i < (int32_t) batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, (int32_t) (batch.n_tokens - i));
 
@@ -162,6 +181,8 @@ int main(int argc, char ** argv) {
     LOG_TEE("%s: n_kv_max = %d, is_pp_shared = %d, n_gpu_layers = %d, mmq = %d, n_threads = %u, n_threads_batch = %u\n", __func__, n_kv_max, is_pp_shared, n_gpu_layers, mmq, ctx_params.n_threads, ctx_params.n_threads_batch);
     LOG_TEE("\n");
 
+    LOG_TEE("%s: lookahead = %d, accept = %d\n", __func__, lookahead, accept);
+
     LOG_TEE("|%6s | %6s | %4s | %6s | %8s | %8s | %8s | %8s | %8s | %8s |\n", "PP",     "TG",     "B",    "N_KV",     "T_PP s",   "S_PP t/s", "T_TG s",   "S_TG t/s", "T s",      "S t/s");
     LOG_TEE("|%6s-|-%6s-|-%4s-|-%6s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|-%8s-|\n", "------", "------", "----", "------", "--------", "--------", "--------", "--------", "--------", "--------");
 
@@ -175,6 +196,7 @@ int main(int argc, char ** argv) {
                 const int n_ctx_req = is_pp_shared ? pp + pl*tg : pl*(pp + tg);
 
                 if (n_ctx_req > n_kv_max) {
+                    LOG_TEE("%s: n_ctx_req = %d > n_kv_max = %d, skipping\n", __func__, n_ctx_req, n_kv_max);
                     continue;
                 }
 
@@ -206,16 +228,23 @@ int main(int argc, char ** argv) {
 
                 const auto t_tg_start = ggml_time_us();
 
-                for (int i = 0; i < tg; ++i) {
+                for (int i = 0; i < tg; i += accept) {
                     llama_batch_clear(batch);
 
                     for (int j = 0; j < pl; ++j) {
-                        llama_batch_add(batch, 0, pp + i, { j }, true);
+                        for (int k = 0; k < lookahead; ++k) {
+                            llama_batch_add(batch, 0, pp + i + k, { j }, true);
+                        }
                     }
 
                     if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
                         LOG_TEE("%s: llama_decode() failed\n", __func__);
                         return 1;
+                    }
+
+                    // clear the unmatched kv-cache entries
+                    for (int32_t i = 0; i < pl; ++i) {
+                        llama_kv_cache_seq_rm(ctx, i, pp + i + accept, pp + i + lookahead);
                     }
                 }
 
