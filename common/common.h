@@ -144,6 +144,10 @@ struct gpt_params {
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V
 
+    std::string speculative_saving = ""; // path to file for saving generated tokens
+    bool speculative_random        = false; // randomize the speculative decoding
+    float speculative_force_accept = -1; // prob to force accept a token during speculative decoding
+
     // multimodal models (see examples/llava)
     std::string mmproj = ""; // path to multimodal projector
     std::string image  = ""; // path to an image file

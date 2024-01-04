@@ -861,6 +861,20 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.kv_overrides.push_back(kvo);
+        } else if (arg == "--speculative-saving") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.speculative_saving = argv[i];
+        } else if (arg == "--speculative-random") {
+            params.speculative_random = true;
+        } else if (arg == "--speculative-force-accept") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.speculative_force_accept = std::stof(argv[i]);
 #ifndef LOG_DISABLE_LOGS
         // Parse args for logging parameters
         } else if ( log_param_single_parse( argv[i] ) ) {
@@ -1081,6 +1095,12 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     printf("                        types: int, float, bool. example: --override-kv tokenizer.ggml.add_bos_token=bool:false\n");
     printf("  -ptc N, --print-token-count N\n");
     printf("                        print token count every N tokens (default: %d)\n", params.n_print);
+    printf("  --speculative-saving TOKEN_FILE\n");
+    printf("                        saving generated tokens to test speculative sampling (default %s)\n", params.speculative_saving.c_str());
+    printf("  --speculative-random\n");
+    printf("                        randomly generated draft tokens to test speculative sampling (default %d)\n", params.speculative_random);
+    printf("  --speculative-force-accept ACCEPT_RATE\n");
+    printf("                        force accept speculative tokens to test speculative sampling (default %f)\n", params.speculative_force_accept);
     printf("\n");
 #ifndef LOG_DISABLE_LOGS
     log_print_usage();
