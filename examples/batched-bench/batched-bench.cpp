@@ -157,7 +157,7 @@ int main(int argc, char ** argv) {
 
             const int ret = llama_decode(ctx, batch_view);
             if (ret != 0) {
-                LOG_TEE("failed to decode the batch, n_batch = %d, ret = %d\n", n_batch, ret);
+                LOG_TEE("failed to decode the batch, n_batch = %d, n_tokens = %d, ret = %d\n", n_batch, n_tokens, ret);
                 return false;
             }
         }
@@ -232,7 +232,7 @@ int main(int argc, char ** argv) {
                     llama_batch_clear(batch);
 
                     for (int j = 0; j < pl; ++j) {
-                        for (int k = 0; k < lookahead; ++k) {
+                        for (int k = 0; k < lookahead && i + k < tg; ++k) {
                             llama_batch_add(batch, 0, pp + i + k, { j }, true);
                         }
                     }
@@ -244,7 +244,7 @@ int main(int argc, char ** argv) {
 
                     // clear the unmatched kv-cache entries
                     for (int32_t i = 0; i < pl; ++i) {
-                        llama_kv_cache_seq_rm(ctx, i, pp + i + accept, pp + i + lookahead);
+                        llama_kv_cache_seq_rm(ctx, i, pp + std::min(i + accept, tg), -1);
                     }
                 }
 
