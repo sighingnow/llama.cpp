@@ -1629,6 +1629,9 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    enum ggml_type type_k; // data type for K cache
+    enum ggml_type type_v; // data type for V cache
 };
 
 struct llama_layer {
@@ -2220,6 +2223,191 @@ static void llama_kv_cache_seq_div(
             }
         }
     }
+}
+
+static size_t query_kv_cache_buffer_size(struct llama_kv_cache & cache) {
+    return cache.total_size();
+}
+
+template <typename T>
+static void repermute_k_cache(T *dst, const T *src, size_t nelement, size_t stride,
+                              size_t repermute_k) {
+    size_t offset = 0;
+    for (size_t k = 0; k < nelement / repermute_k; ++k) {
+        for (size_t i = 0; i < stride; ++i) {
+            for (size_t j = 0; j < repermute_k / stride; ++j) {
+                dst[offset++] = src[k * repermute_k + j * stride + i];
+            }
+        }
+    }
+}
+
+static int export_kv_cache_buffers(struct llama_context * ctx,
+                                   struct llama_kv_cache & cache,
+                                   uint8_t * buffer,
+                                   size_t buffer_size,
+                                   uint32_t n_embd_k_gqa,
+                                   uint32_t n_embd_v_gqa,
+                                   uint32_t n_layer,
+                                   uint32_t n_ctx,
+                                   llama_seq_id seq_id,
+                                   llama_pos p0, llama_pos p1,
+                                   int layer0, int layer1,
+                                   size_t repermute_k) {
+    const uint32_t kv_head = cache.head;
+    const uint32_t kv_size = cache.size;
+    const uint32_t kv_used = cache.used;
+    LLAMA_LOG_INFO("%s: export kv cache: n_ctx = %u, n_embd_k_gqa = %u, n_embd_v_gqa = %u, "
+                   "kv head = %u, kv size = %u, kv used = %u\n",
+                   __func__, n_ctx, n_embd_k_gqa, n_embd_v_gqa, kv_head, kv_size, kv_used);
+
+    const ggml_type type_k = ctx->cparams.type_k;
+    const ggml_type type_v = ctx->cparams.type_v;
+    LLAMA_LOG_INFO("%s: type_k = %s, type_v = %s\n", __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+
+    if (p0 > p1) {
+        LLAMA_LOG_ERROR("%s: invalid token index range: p0 = %d, p1 = %d\n", __func__, p0, p1);
+        return 1;
+    }
+    if (layer1 == -1) {
+        layer1 = n_layer;
+    }
+    if (layer0 > layer1) {
+        LLAMA_LOG_ERROR("%s: invalid layer range: layer0 = %d, layer1 = %d\n", __func__, layer0, layer1);
+        return 1;
+    }
+
+    // figure out kv cache entry indices to export
+    std::vector<uint32_t> export_indices(p1 - p0, 0x7fffffff);
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
+            export_indices[cache.cells[i].pos - p0] = i;
+        }
+    }
+    for (uint32_t i = 0; i < export_indices.size(); ++i) {
+        if (export_indices[i] == 0x7fffffff) {
+            LLAMA_LOG_ERROR("%s: missing kv cache entry for token index %u\n", __func__, p0 + i);
+            return 1;
+        }
+        // LLAMA_LOG_INFO("%s: export_indices[%d] = %d\n", __func__, i, export_indices[i]);
+    }
+
+    // see also:
+    //  - llama_copy_state_data_internal
+    //  - llama_set_state_data
+    const size_t elt_size = ggml_element_size(cache.k_l[0]);
+
+    // N.B.: there's token-level, 128-chunked, permute/transpose between llama.cpp's k-cache
+    // and vllm's k-cache.
+    std::vector<uint8_t> k_permute_buffer;
+
+    // optimize: copy the v cache buffer to host memory first
+    // to avoid element-wise GPU-CPU memory access
+    std::unique_ptr<uint8_t> v_buffer_mirror = nullptr;  // use unique_ptr for auto-release
+    if (cache.v_l[0]->backend != GGML_BACKEND_CPU) {
+        v_buffer_mirror = std::unique_ptr<uint8_t>(
+            (uint8_t *) malloc((layer1 - layer0) * kv_head * n_embd_v_gqa * elt_size));
+        // the memory allocation may fail
+        if (v_buffer_mirror != nullptr) {
+            for (int il = layer0; il < layer1; ++il) {
+                ggml_backend_t backend = ggml_backend_sched_get_node_backend(ctx->sched, cache.v_l[il]);
+                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                    ggml_backend_tensor_get_async(
+                        backend, cache.v_l[il],
+                        v_buffer_mirror.get() + (il - layer0) * n_embd_v_gqa * elt_size * kv_head
+                                              + ir * elt_size * kv_head,
+                        ir * elt_size * kv_size,
+                        elt_size * kv_head);
+                }
+                ggml_backend_synchronize(backend);
+            }
+        }
+    }
+
+    size_t offset = 0;
+    for (int ip = p0; ip < p1; ++ip) {
+        // LLAMA_LOG_INFO("%s: seq_id = %d, export_indices[ip - p0] = %d\n", __func__, seq_id, export_indices[ip - p0]);
+        for (int il = layer0; il < layer1; ++il) {
+            // get k buffer and re-permute
+            size_t k_nbytes = n_embd_k_gqa * elt_size;
+            if (offset + k_nbytes > buffer_size) {
+                LLAMA_LOG_ERROR("%s: buffer overflow: offset = %zu, k_nbytes = %zu, buffer_size = %zu\n",
+                                __func__, offset, k_nbytes, buffer_size);
+                return 1;
+            }
+            uint8_t *k_buffer = buffer + offset;
+            if (repermute_k > 1) {
+                k_permute_buffer.resize(k_nbytes);
+                k_buffer = k_permute_buffer.data();
+            }
+            ggml_backend_tensor_get(
+                cache.k_l[il],
+                k_buffer,
+                elt_size * n_embd_k_gqa * export_indices[ip - p0],
+                k_nbytes);
+            // re-premute the k-cache of llama.cpp
+            if (repermute_k > 1) {
+                if (elt_size == 8) {
+                    // 8-byte double
+                    repermute_k_cache(reinterpret_cast<uint64_t *>(buffer + offset),
+                                      reinterpret_cast<uint64_t *>(k_buffer),
+                                      k_nbytes / 8, 2, repermute_k);
+                } else if (elt_size == 4) {
+                    // 4-byte float
+                    repermute_k_cache(reinterpret_cast<uint32_t *>(buffer + offset),
+                                      reinterpret_cast<uint32_t *>(k_buffer),
+                                      k_nbytes / 4, 2, repermute_k);
+                } else if (elt_size == 2) {
+                    // 2-byte half
+                    repermute_k_cache(reinterpret_cast<uint16_t *>(buffer + offset),
+                                      reinterpret_cast<uint16_t *>(k_buffer),
+                                      k_nbytes / 2, 2, repermute_k);
+                } else if (elt_size == 1) {
+                    repermute_k_cache(reinterpret_cast<uint8_t *>(buffer + offset),
+                                      reinterpret_cast<uint8_t *>(k_buffer),
+                                      k_nbytes / 1, 2, repermute_k);
+                } else {
+                    LLAMA_LOG_ERROR("%s: unsupported k-cache element size: %zu\n", __func__, elt_size);
+                    return 1;
+                }
+            }
+            offset += k_nbytes;
+
+            // get v buffer row-by-row as v is not contiguous
+            size_t v_nbytes = n_embd_v_gqa * elt_size;
+            if (offset + v_nbytes > buffer_size) {
+                LLAMA_LOG_ERROR("%s: buffer overflow: offset = %zu, v_nbytes = %zu, buffer_size = %zu\n",
+                                __func__, offset, v_nbytes, buffer_size);
+                return 1;
+            }
+            if (v_buffer_mirror != nullptr) {
+                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                    memcpy(buffer + offset,
+                           v_buffer_mirror.get() + (il - layer0) * n_embd_v_gqa * elt_size * kv_head
+                                                 + ir * elt_size * kv_head
+                                                 + export_indices[ip - p0] * elt_size,
+                           elt_size);
+                    offset += elt_size;
+                }
+            } else {
+                ggml_backend_t backend = ggml_backend_sched_get_node_backend(ctx->sched, cache.v_l[il]);
+                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                    ggml_backend_tensor_get_async(
+                        backend, cache.v_l[il],
+                        buffer + offset,
+                        ir * elt_size * kv_size + elt_size * export_indices[ip - p0],
+                        elt_size);
+                    offset += elt_size;
+                }
+                ggml_backend_synchronize(backend);
+            }
+        }
+    }
+    if (offset != buffer_size) {
+        LLAMA_LOG_ERROR("%s: buffer size mismatched: offset = %zu, buffer_size = %zu\n", __func__, offset, buffer_size);
+        return 1;
+    }
+    return 0;
 }
 
 //
@@ -11327,6 +11515,8 @@ struct llama_context * llama_new_context_with_model(
     cparams.mul_mat_q        = params.mul_mat_q;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.do_pooling       = params.do_pooling;
+    cparams.type_k           = params.type_k;
+    cparams.type_v           = params.type_v;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -11673,6 +11863,18 @@ uint64_t llama_model_n_params(const struct llama_model * model) {
     return nparams;
 }
 
+uint64_t llama_model_n_layer(const struct llama_model * model) {
+    return model->hparams.n_layer;
+}
+
+uint64_t llama_model_n_embd_k_gqa(const struct llama_model * model) {
+    return model->hparams.n_embd_k_gqa();
+}
+
+uint64_t llama_model_n_embd_v_gqa(const struct llama_model * model) {
+    return model->hparams.n_embd_v_gqa();
+}
+
 struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name) {
     auto it = std::find_if(model->tensors_by_name.begin(), model->tensors_by_name.end(),
             [name](const std::pair<std::string, struct ggml_tensor *> & it) {
@@ -11851,6 +12053,29 @@ void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_div(ctx->kv_self, seq_id, p0, p1, d);
+}
+
+size_t query_kv_cache_buffer_size(struct llama_context * ctx) {
+    return query_kv_cache_buffer_size(ctx->kv_self);
+}
+
+int export_kv_cache_buffers(struct llama_context * ctx,
+                            void * buffer,
+                            size_t buffer_size,
+                            llama_seq_id seq_id,
+                            llama_pos p0, llama_pos p1,
+                            int layer0, int layer1,
+                            size_t repermute_k) {
+    const struct llama_hparams & hparams = ctx->model.hparams;
+    const uint32_t n_embd_k_gqa  = hparams.n_embd_k_gqa();
+    const uint32_t n_embd_v_gqa  = hparams.n_embd_v_gqa();
+    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_ctx = ctx->cparams.n_ctx;
+    return export_kv_cache_buffers(ctx, ctx->kv_self,
+                                   reinterpret_cast<uint8_t *>(buffer), buffer_size,
+                                   n_embd_k_gqa, n_embd_v_gqa, n_layer, n_ctx,
+                                   seq_id, p0, p1, layer0, layer1,
+                                   repermute_k);
 }
 
 // Returns the *maximum* size of the state

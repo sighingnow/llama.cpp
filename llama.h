@@ -391,6 +391,15 @@ extern "C" {
     // Returns the total number of parameters in the model
     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 
+    // Returns the number of layers of the model
+    LLAMA_API uint64_t llama_model_n_layer(const struct llama_model * model);
+
+    // Returns the kv cache size (n_embed_k / n_gqa) in the model
+    LLAMA_API uint64_t llama_model_n_embd_k_gqa(const struct llama_model * model);
+
+    // Returns the kv cache size (n_embed_v / n_gqa) in the model
+    LLAMA_API uint64_t llama_model_n_embd_v_gqa(const struct llama_model * model);
+
     // Get a llama model tensor
     LLAMA_API struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name);
 
@@ -531,6 +540,19 @@ extern "C" {
                        llama_pos   p0,
                        llama_pos   p1,
                              int   d);
+
+    // Query the buffer size of underlying KV cache.
+    LLAMA_API size_t query_kv_cache_buffer_size(struct llama_context * ctx);
+
+    // Copy the KV cache for the given sequence, given token index, and given layer,
+    // to the given buffer.
+    LLAMA_API int export_kv_cache_buffers(struct llama_context * ctx,
+                                          void * buffer,
+                                          size_t buffer_size,
+                                          llama_seq_id seq_id,
+                                          llama_pos p0, llama_pos p1,
+                                          int layer0, int layer1,
+                                          size_t repermute_k);
 
     //
     // State / sessions
