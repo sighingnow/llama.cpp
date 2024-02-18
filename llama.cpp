@@ -1597,6 +1597,10 @@ struct llama_hparams {
         return n_head/n_head_kv;
     }
 
+    uint32_t n_embd_head() const {
+        return n_embd/n_head;
+    }
+
     uint32_t n_embd_k_gqa() const { // dimension of key embeddings across all k-v heads
         return n_embd_head_k * n_head_kv;
     }
@@ -11873,6 +11877,10 @@ uint64_t llama_model_n_embd_k_gqa(const struct llama_model * model) {
 
 uint64_t llama_model_n_embd_v_gqa(const struct llama_model * model) {
     return model->hparams.n_embd_v_gqa();
+}
+
+uint64_t llama_model_n_embd_head(const struct llama_model * model) {
+    return model->hparams.n_embd_head();
 }
 
 struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name) {

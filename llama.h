@@ -400,6 +400,9 @@ extern "C" {
     // Returns the kv cache size (n_embed_v / n_gqa) in the model
     LLAMA_API uint64_t llama_model_n_embd_v_gqa(const struct llama_model * model);
 
+    // Returns the head size (n_embed / n_head) in the model
+    LLAMA_API uint64_t llama_model_n_embd_head(const struct llama_model * model);
+
     // Get a llama model tensor
     LLAMA_API struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name);
 

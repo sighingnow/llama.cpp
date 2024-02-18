@@ -128,8 +128,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // As far as I know, the permute chunk size for Q4_0 is 128.
-    size_t repermute_k = 128;
+    // see also:
+    // - https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py#L133-L135
+    // - https://github.com/ggerganov/llama.cpp/blob/master/convert.py#L565
+    size_t repermute_k = llama_model_n_embd_head(model);
 
     // dump the kv-cache
     std::string prompt_prefix_file_name = prompt_file_name + ".prefix";
