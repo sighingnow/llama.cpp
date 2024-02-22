@@ -3,7 +3,7 @@
 The purpose of this example is to demonstrate a minimal usage of suri.cpp for generating text with a given prompt (with collaboration with the vLLM server).
 
 ```bash
-./bin/suri ~/models/llama-2-70b.AWQ.fp16.Q4_0.gguf "Hello my name is" 0 32
+./bin/suri ~/models/llama-2-70b.AWQ.fp16.Q4_0.gguf "Hello my name is" 16 999 32
 
 ...
 

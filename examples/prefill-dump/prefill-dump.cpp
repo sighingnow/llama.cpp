@@ -153,9 +153,10 @@ int main(int argc, char ** argv) {
         //   ] * number of requests
 
         out.write(reinterpret_cast<char *>(&tokens_lists_size), 4);
-        uint32_t n_cache_elements = llama_model_n_embd_k_gqa(model);
-        uint32_t k_tensor_size = ggml_row_size(ctx_params.type_k, n_cache_elements);
-        uint32_t v_tensor_size = ggml_row_size(ctx_params.type_v, n_cache_elements);
+        uint32_t k_cache_elements = llama_model_n_embd_k_gqa(model);
+        uint32_t v_cache_elements = llama_model_n_embd_k_gqa(model);
+        uint32_t k_tensor_size = ggml_row_size(ctx_params.type_k, k_cache_elements);
+        uint32_t v_tensor_size = ggml_row_size(ctx_params.type_v, v_cache_elements);
         uint32_t n_layers = llama_model_n_layer(model);
         uint64_t kv_cache_buffer_size = max_token_list_size
             * n_layers

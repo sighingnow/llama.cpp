@@ -400,8 +400,14 @@ extern "C" {
     // Returns the kv cache size (n_embed_v / n_gqa) in the model
     LLAMA_API uint64_t llama_model_n_embd_v_gqa(const struct llama_model * model);
 
+    // Returns the head size n_embed in the model
+    LLAMA_API uint64_t llama_model_n_embd(const struct llama_model * model);
+
     // Returns the head size (n_embed / n_head) in the model
     LLAMA_API uint64_t llama_model_n_embd_head(const struct llama_model * model);
+
+    // Enable skipping the first k layers when building the next computation graph.
+    LLAMA_API void llama_model_skip_layers(struct llama_model * model, int n_skip_layers);
 
     // Get a llama model tensor
     LLAMA_API struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name);

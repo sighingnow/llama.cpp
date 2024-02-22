@@ -1818,6 +1818,7 @@ struct llama_model {
     llama_split_mode split_mode;
     int main_gpu;
     int n_gpu_layers;
+    int n_skip_layers = 0;
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
@@ -5236,7 +5237,7 @@ struct llm_build_context {
             llm_build_k_shift(ctx0, hparams, cparams, kv_self, gf, lctx.inp_K_shift, LLM_ROPE, n_ctx, freq_base, freq_scale, cb);
         }
 
-        for (int il = 0; il < n_layer; ++il) {
+        for (int il = model.n_skip_layers; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
 
             // norm
@@ -7691,6 +7692,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     if (batch.embd) {
         const int64_t n_embd   = hparams.n_embd;
         const int64_t n_tokens = batch.n_tokens;
+
+        // validate the dtype of embedding buffer
+        if (lctx.inp_embd->type != GGML_TYPE_F32) {
+            LLAMA_LOG_ERROR("%s: inp_embd dtype = %s vs. embd dtype = %s\n",
+                            __func__, ggml_type_name(lctx.inp_embd->type), ggml_type_name(GGML_TYPE_F32));
+        }
 
         ggml_backend_tensor_set(lctx.inp_embd, batch.embd, 0, n_tokens*n_embd*ggml_element_size(lctx.inp_embd));
     }
@@ -11879,8 +11886,16 @@ uint64_t llama_model_n_embd_v_gqa(const struct llama_model * model) {
     return model->hparams.n_embd_v_gqa();
 }
 
+uint64_t llama_model_n_embd(const struct llama_model * model) {
+    return model->hparams.n_embd;
+}
+
 uint64_t llama_model_n_embd_head(const struct llama_model * model) {
     return model->hparams.n_embd_head();
+}
+
+void llama_model_skip_layers(struct llama_model * model, int n_skip_layers) {
+    model->n_skip_layers = n_skip_layers;
 }
 
 struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name) {
