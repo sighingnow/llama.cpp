@@ -172,6 +172,8 @@ static std::tuple<size_t /* buffer_nbytes */,
     llama_model *model,
     llama_pos token_start_pos,
     llama_pos token_stop_pos,
+    int layer0,
+    int layer1,
     llama_seq_id seq_id,
     std::vector<uint8_t> &buffer)
 {
@@ -183,26 +185,32 @@ static std::tuple<size_t /* buffer_nbytes */,
     size_t repermute_k = llama_model_n_embd_head(model);
     llama_pos sequence_length = token_stop_pos - token_start_pos;
 
+    if (layer0 >= layer1) {
+        LOG_TEE("%s: error: invalid layer range: [%d, %d)\n", __func__, layer0, layer1);
+        return std::make_tuple(0, 0, 0);
+    }
+
     uint32_t k_cache_elements = llama_model_n_embd_k_gqa(model);
     uint32_t v_cache_elements = llama_model_n_embd_v_gqa(model);
     uint32_t k_tensor_nbytes = ggml_row_size(ctx_params.type_k, k_cache_elements);
     uint32_t v_tensor_nbytes = ggml_row_size(ctx_params.type_v, v_cache_elements);
-    uint32_t n_layers = llama_model_n_layer(model);
     uint64_t buffer_nbytes = sequence_length
-            * n_layers
+            * (layer1 - layer0)
             * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
-    LOG_TEE("%s: allocate kv_cache buffer size = %zu\n", __func__, buffer_nbytes);
-    buffer.resize(buffer_nbytes);
+    if (buffer.size() < buffer_nbytes) {
+        buffer.resize(buffer_nbytes);
+    }
 
     if (export_kv_cache_buffers(ctx, buffer.data(), buffer_nbytes,
-                                seq_id, token_start_pos, token_stop_pos, 0, n_layers,
+                                seq_id, token_start_pos, token_stop_pos, layer0, layer1,
                                 repermute_k) != 0) {
         LOG_TEE("%s: export_kv_cache_buffers() failed\n", __func__);
         return std::make_tuple(0, 0, 0);
     }
-    LOG_TEE("%s: exported: sequence_length = %u (%u -> %u), n_layers = %u, current_buffer_size = %zu\n",
-            __func__, sequence_length, token_start_pos, token_stop_pos, n_layers, buffer_nbytes);
-    return std::make_tuple(buffer_nbytes, n_layers, k_tensor_nbytes);
+    LOG_TEE("%s: exported: sequence_length = %u (%u -> %u), n_layers = %d (%d -> %d), current_buffer_size = %zu\n",
+            __func__, sequence_length, token_start_pos, token_stop_pos,
+            layer1 - layer0, layer0, layer1, buffer_nbytes);
+    return std::make_tuple(buffer_nbytes, layer1 - layer0, k_tensor_nbytes);
 }
 
 static int tokenize(
@@ -434,17 +442,17 @@ int main(int argc, char ** argv) {
     ctx_params.type_v = GGML_TYPE_F16;
 
     llama_context * ctx = llama_new_context_with_model(model, ctx_params);
+    if (ctx == NULL) {
+        LOG_TEE("%s: error: failed to create the llama_context\n" , __func__);
+        return 1;
+    }
     uint32_t n_ctx = llama_n_ctx(ctx);
     uint32_t n_embd = llama_model_n_embd(model);
+    uint32_t n_layers = llama_model_n_layer(model);
 
     // sampling context
     params.sparams.temp = 0.0f;  // greedy
     struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
-
-    if (ctx == NULL) {
-        LOG_TEE( "%s: error: failed to create the llama_context\n" , __func__);
-        return 1;
-    }
 
     // tokenize the prompt
     std::vector<std::vector<llama_token>> tokens_lists(prompts.size());
@@ -507,6 +515,7 @@ int main(int argc, char ** argv) {
             auto tup = export_kv_cache_buffers(
                 ctx_params, ctx, model,
                 n_prefill_progress, n_prefill_progress + n_prompt_chunk,
+                0, n_layers - params.n_skip_layers,
                 seq_id, prefix_caches);
             size_t buffer_nbytes = std::get<0>(tup);
             uint32_t num_layers = std::get<1>(tup);
