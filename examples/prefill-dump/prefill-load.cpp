@@ -8,9 +8,7 @@
 #include <string>
 #include <vector>
 
-static std::tuple<size_t /* buffer_nbytes */,
-                  uint32_t /* num_layers */,
-                  uint32_t /* tensor_nbytes */> export_kv_cache_buffers(
+static int import_kv_cache_buffers(
     llama_context_params ctx_params,
     llama_context * ctx,
     llama_model *model,
@@ -28,10 +26,14 @@ static std::tuple<size_t /* buffer_nbytes */,
     // - https://github.com/ggerganov/llama.cpp/blob/master/convert.py#L565
     size_t repermute_k = llama_model_n_embd_head(model);
     llama_pos sequence_length = token_stop_pos - token_start_pos;
+    if (sequence_length == 0) {
+        LOG_TEE("%s: skip non-cached sequence: %u\n", __func__, seq_id);
+        return 0;
+    }
 
     if (layer0 >= layer1) {
         LOG_TEE("%s: error: invalid layer range: [%d, %d)\n", __func__, layer0, layer1);
-        return std::make_tuple(0, 0, 0);
+        return -1;
     }
 
     uint32_t k_cache_elements = llama_model_n_embd_k_gqa(model);
@@ -42,20 +44,17 @@ static std::tuple<size_t /* buffer_nbytes */,
     uint64_t buffer_nbytes = sequence_length
             * n_layers
             * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
-    if (buffer.size() < buffer_nbytes) {
-        buffer.resize(buffer_nbytes);
-    }
 
-    if (export_kv_cache_buffers(ctx, buffer.data(), buffer_nbytes,
+    if (import_kv_cache_buffers(ctx, buffer.data(), buffer_nbytes,
                                 seq_id, token_start_pos, token_stop_pos, 0, n_layers,
                                 repermute_k) != 0) {
-        LOG_TEE("%s: export_kv_cache_buffers() failed\n", __func__);
-        return std::make_tuple(0, 0, 0);
+        LOG_TEE("%s: import_kv_cache_buffers() failed\n", __func__);
+        return -1;
     }
-    LOG_TEE("%s: exported: sequence_length = %u (%u -> %u), n_layers = %d (%d -> %d), current_buffer_size = %zu\n",
+    LOG_TEE("%s: imported: sequence_length = %u (%u -> %u), n_layers = %d (%d -> %d), current_buffer_size = %zu\n",
             __func__, sequence_length, token_start_pos, token_stop_pos,
             layer1 - layer0, layer0, layer1, buffer_nbytes);
-    return std::make_tuple(buffer_nbytes, layer1 - layer0, k_tensor_nbytes);
+    return 0;
 }
 
 static int tokenize(
@@ -180,13 +179,27 @@ static int decode(
     return 0;
 }
 
+static inline std::string escape(const std::string &str) {
+    std::string escaped;
+    for (char c : str) {
+        if (c == '\n') {
+            escaped += "\\n";
+        } else if (c == '\r') {
+            escaped += "\\r";
+        } else if (c == '\t') {
+            escaped += "\\t";
+        } else {
+            escaped += c;
+        }
+    }
+    return escaped;
+}
+
 int main(int argc, char ** argv) {
     gpt_params params;
 
-    llama_pos n_prompt_chunk = 48;
-
-    if (argc == 1 || argv[1][0] == '-') {
-        printf("usage: %s MODEL_PATH [PROMPT OR PROMPT_FILE] [N_PROMPT_CHUNK] [N_GPU_LAYERS] [N_SKIP_LAYERS] [N_PREDICT] [N_BATCH]\n" , argv[0]);
+    if (argc < 4 || argv[1][0] == '-') {
+        printf("usage: %s MODEL_PATH [PROMPT OR PROMPT_FILE] [N_GPU_LAYERS] [N_SKIP_LAYERS] [N_PREDICT] [N_BATCH]\n" , argv[0]);
         return 1 ;
     }
 
@@ -199,23 +212,19 @@ int main(int argc, char ** argv) {
     }
 
     if (argc >= 4) {
-        n_prompt_chunk = std::atoi(argv[3]);
+        params.n_gpu_layers = std::atoi(argv[3]);
     }
 
     if (argc >= 5) {
-        params.n_gpu_layers = std::atoi(argv[4]);
+        params.n_skip_layers = std::atoi(argv[4]);
     }
 
     if (argc >= 6) {
-        params.n_skip_layers = std::atoi(argv[5]);
+        params.n_predict = std::atoi(argv[5]);
     }
 
     if (argc >= 7) {
-        params.n_predict = std::atoi(argv[6]);
-    }
-
-    if (argc >= 8) {
-        params.n_batch = std::atoi(argv[7]);
+        params.n_batch = std::atoi(argv[6]);
     }
 
     if (params.prompt.empty()) {
@@ -239,6 +248,21 @@ int main(int argc, char ** argv) {
                 prompts.push_back(line);
             }
         }
+    }
+    std::string prompt_prefix_file_name = prompt_file_name + ".prefix";
+    std::ifstream in(prompt_prefix_file_name);
+    {
+        if (!in.is_open()) {
+            LOG_TEE("%s: error: failed to load the prompt prefix: %s\n", __func__, prompt_prefix_file_name.c_str());
+            return 1;
+        }
+    }
+    uint32_t num_requests;
+    in.read(reinterpret_cast<char *>(&num_requests), 4);
+    if (num_requests != prompts.size()) {
+        LOG_TEE("%s: error: inconsistent: num_requests = %u, prompts.size() = %zu\n",
+                __func__, num_requests, prompts.size());
+        return 1;
     }
 
     // init LLM
@@ -277,7 +301,7 @@ int main(int argc, char ** argv) {
     uint32_t n_layers = llama_model_n_layer(model);
 
     // sampling context
-    params.sparams.temp = 0.0f;  // greedy
+    params.sparams.temp = 1.0f;  // 0.0 for greedy and 1.0 for random
     struct llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
 
     // tokenize the prompt
@@ -295,6 +319,7 @@ int main(int argc, char ** argv) {
 
     std::vector<std::vector<uint8_t>> hidden_states;
     std::vector<llama_token> out_tokens;
+    std::string output_content;
 
     // dump the kv-cache
     //
@@ -308,73 +333,48 @@ int main(int argc, char ** argv) {
     //       ] * number of layers
     //     ] * number of tokens
     //   ] * number of requests
-    std::string prompt_prefix_file_name = prompt_file_name + ".prefix";
-    std::ofstream out(prompt_prefix_file_name, std::ios::binary);
-    if (!out.is_open()) {
-        LOG_TEE("%s: failed to open %s\n", __func__, prompt_prefix_file_name.c_str());
-        return 1;
-    }
-    out.write(reinterpret_cast<char *>(&tokens_lists_size), 4);
-
     uint32_t k_cache_elements = llama_model_n_embd_k_gqa(model);
     uint32_t v_cache_elements = llama_model_n_embd_k_gqa(model);
     uint32_t k_tensor_nbytes = ggml_row_size(ctx_params.type_k, k_cache_elements);
     uint32_t v_tensor_nbytes = ggml_row_size(ctx_params.type_v, v_cache_elements);
 
     for (llama_seq_id seq_id = 0; seq_id < tokens_lists_size; seq_id++) {
-        llama_pos n_tokens = tokens_lists[seq_id].size();
-        llama_pos n_prefill = n_prompt_chunk * std::max(
-            0, (n_tokens + n_prompt_chunk - 1) / n_prompt_chunk - 2);
-        out.write(reinterpret_cast<char *>(&n_prefill), 4);
+        llama_pos n_prefill = 0;
+        in.read(reinterpret_cast<char *>(&n_prefill), 4);
 
-        if (n_prefill == 0) {
-            LOG_TEE("%s: exported seqeunce %u: n_tokens = %u\n", __func__, seq_id, n_prefill);
-            continue;
-        }
+        // reset the context
+        out_tokens.clear();
+        output_content.clear();
 
-        std::vector<llama_token> tokens(tokens_lists[seq_id].begin(),
-                                        tokens_lists[seq_id].begin() + n_prefill);
-
-        if (decode(ctx, ctx_sampling, model,
-                   batch, batch_tokens, batch_embd, params.n_batch, n_embd,
-                   seq_id, tokens,
-                   0, n_prefill,
-                   hidden_states, 0,
-                   std::vector<llama_token>{},
-                   out_tokens) != 0) {
-            LOG_TEE("%s: prefill() failed\n", __func__);
-            return 1;
-        }
-
-        // dump the kv-cache
-        export_kv_cache_buffers(
-            ctx_params, ctx, model,
-            0, n_prefill,
-            0, n_layers - params.n_skip_layers,
-            seq_id, prefix_caches);
-
-        // not used any more
-        llama_kv_cache_seq_rm(ctx, seq_id, 0, n_prefill);
-
-        int layer_to_export = n_layers - params.n_skip_layers;
+        // read kv cache from file
         uint64_t buffer_nbytes = n_prefill
-            * layer_to_export
-            * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
-
+                * n_layers
+                * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
+        if (prefix_caches.size() < buffer_nbytes) {
+            prefix_caches.resize(buffer_nbytes);
+        }
         uint64_t offset = 0;
-        for (llama_pos p = 0; p < n_prefill; ++p) {
-            uint32_t token_id = tokens[p];
-            // printf("%s: seq_id: %u, token_id = %u\n", __func__, i, token_id);
-            out.write(reinterpret_cast<char *>(&token_id), 4);
-            out.write(reinterpret_cast<char *>(&layer_to_export), 4);
-            for (int32_t l = 0; l < layer_to_export; ++l) {
-                // write key
-                out.write(reinterpret_cast<char *>(&k_tensor_nbytes), 4);
-                out.write(reinterpret_cast<char *>(prefix_caches.data()) + offset, k_tensor_nbytes);
+        for (llama_pos i = 0; i < n_prefill; ++i) {
+            llama_token token_id;
+            in.read(reinterpret_cast<char *>(&token_id), 4);
+            if (token_id != tokens_lists[seq_id][i]) {
+                LOG_TEE("%s: error: inconsistent: token_id = %u, tokens_lists[%u][%u] = %u\n",
+                        __func__, token_id, seq_id, i, tokens_lists[seq_id][i]);
+            }
+            uint32_t num_layers;
+            in.read(reinterpret_cast<char *>(&num_layers), 4);
+            if (num_layers != n_layers) {
+                LOG_TEE("%s: error: inconsistent: num_layers = %u, model n_layers = %u\n",
+                        __func__, num_layers, n_layers);
+            }
+            for (uint32_t l = 0; l < num_layers; ++l) {
+                // read key
+                in.read(reinterpret_cast<char *>(&k_tensor_nbytes), 4);
+                in.read(reinterpret_cast<char *>(prefix_caches.data() + offset), k_tensor_nbytes);
                 offset += k_tensor_nbytes;
-                // write value
-                out.write(reinterpret_cast<char *>(&v_tensor_nbytes), 4);
-                out.write(reinterpret_cast<char *>(prefix_caches.data()) + offset, v_tensor_nbytes);
+                // read value
+                in.read(reinterpret_cast<char *>(&v_tensor_nbytes), 4);
+                in.read(reinterpret_cast<char *>(prefix_caches.data() + offset), v_tensor_nbytes);
                 offset += v_tensor_nbytes;
             }
         }
@@ -383,12 +383,77 @@ int main(int argc, char ** argv) {
                     __func__, offset, buffer_nbytes);
             return 1;
         }
-        LOG_TEE("%s: exported seqeunce %u: n_tokens = %u, n_layers = %u, buffer_nbytes = %zu\n",
-                __func__, seq_id, n_prefill, n_layers, buffer_nbytes);
+
+        // import kv-cache
+        if (n_prefill > 0) {
+            llama_batch_clear(batch);
+
+            batch.token = batch_tokens;
+            batch.embd = nullptr;
+
+            for (llama_pos i = 0; i < n_prefill; i++) {
+                llama_batch_add(batch,
+                                tokens_lists[seq_id][i],
+                                i,
+                                { seq_id },
+                                false);
+            }
+            if (llama_allocate_kvcache_slots(ctx, batch) != 0) {
+                LOG_TEE("%s: llama_allocate_kvcache_slots() failed\n", __func__);
+                return 1;
+            }
+        }
+        if (import_kv_cache_buffers(
+            ctx_params, ctx, model,
+            0, n_prefill,
+            0, n_layers - params.n_skip_layers,
+            seq_id, prefix_caches) != 0) {
+            LOG_TEE("%s: import_kv_cache_buffers() failed\n", __func__);
+            return 1;
+        }
+
+        std::vector<llama_token> tokens(tokens_lists[seq_id].begin() + n_prefill,
+                                        tokens_lists[seq_id].end());
+        llama_pos start_pos = n_prefill;
+        llama_pos stop_pos = tokens_lists[seq_id].size();
+        std::vector<llama_token> decode_outputs;
+
+        // auto-regressive decoding
+        std::cout << "n predict = " << params.n_predict << std::endl;
+        while ((params.n_predict == -1 && (out_tokens.empty() || out_tokens.back() != llama_token_eos(model))) || (params.n_predict > static_cast<int32_t>(out_tokens.size()))) {
+            if (decode(ctx, ctx_sampling, model,
+                       batch, batch_tokens, batch_embd, params.n_batch, n_embd,
+                       seq_id, tokens,
+                       start_pos, stop_pos,
+                       hidden_states, 0,
+                       std::vector<llama_token>{tokens.back()},
+                       decode_outputs) != 0) {
+                LOG_TEE("%s: prefill/decode() failed\n", __func__);
+                return 1;
+            }
+            if (decode_outputs.empty()) {
+                LOG_TEE("%s: error: decode_outputs is empty\n", __func__);
+                return 1;
+            }
+
+            // print the decoded tokens
+            llama_token token_id = decode_outputs.back();
+            out_tokens.push_back(token_id);
+            output_content += escape(llama_token_to_piece(ctx, token_id));
+            fprintf(stderr, "Output[%3zu][%5u]: %s\n", out_tokens.size(), token_id, output_content.c_str());
+
+            // prepare for the next decoding round
+            tokens.clear();
+            tokens.emplace_back(token_id);
+            start_pos = stop_pos;
+            stop_pos = start_pos + 1;
+        }
+
+        // not used any more
+        llama_kv_cache_seq_rm(ctx, seq_id, 0, n_prefill);
     }
 
-    out.flush();
-    out.close();
+    in.close();
 
     llama_print_timings(ctx);
 

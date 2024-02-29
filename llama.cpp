@@ -2247,6 +2247,19 @@ static void repermute_k_cache(T *dst, const T *src, size_t nelement, size_t stri
     }
 }
 
+template <typename T>
+static void depermute_k_cache(T *dst, const T *src, size_t nelement, size_t stride,
+                              size_t repermute_k) {
+    size_t offset = 0;
+    for (size_t k = 0; k < nelement / repermute_k; ++k) {
+        for (size_t i = 0; i < stride; ++i) {
+            for (size_t j = 0; j < repermute_k / stride; ++j) {
+                dst[k * repermute_k + j * stride + i] = src[offset++];
+            }
+        }
+    }
+}
+
 static int export_kv_cache_buffers(struct llama_context * ctx,
                                    struct llama_kv_cache & cache,
                                    uint8_t * buffer,
@@ -2408,6 +2421,193 @@ static int export_kv_cache_buffers(struct llama_context * ctx,
             }
         }
     }
+    if (offset != buffer_size) {
+        LLAMA_LOG_ERROR("%s: buffer size mismatched: offset = %zu, buffer_size = %zu\n", __func__, offset, buffer_size);
+        return 1;
+    }
+    return 0;
+}
+
+static int import_kv_cache_buffers(struct llama_context * ctx,
+                                   struct llama_kv_cache & cache,
+                                   const uint8_t * buffer,
+                                   size_t buffer_size,
+                                   uint32_t n_embd_k_gqa,
+                                   uint32_t n_embd_v_gqa,
+                                   uint32_t n_layer,
+                                   uint32_t n_ctx,
+                                   llama_seq_id seq_id,
+                                   llama_pos p0, llama_pos p1,
+                                   int layer0, int layer1,
+                                   size_t repermute_k) {
+    const uint32_t kv_head = cache.head;
+    const uint32_t kv_size = cache.size;
+    const uint32_t kv_used = cache.used;
+    LLAMA_LOG_INFO("%s: import kv cache: n_ctx = %u, n_embd_k_gqa = %u, n_embd_v_gqa = %u, "
+                   "kv head = %u, kv size = %u, kv used = %u\n",
+                   __func__, n_ctx, n_embd_k_gqa, n_embd_v_gqa, kv_head, kv_size, kv_used);
+
+    const ggml_type type_k = ctx->cparams.type_k;
+    const ggml_type type_v = ctx->cparams.type_v;
+    LLAMA_LOG_INFO("%s: type_k = %s, type_v = %s\n", __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+
+    if (p0 > p1) {
+        LLAMA_LOG_ERROR("%s: invalid token index range: p0 = %d, p1 = %d\n", __func__, p0, p1);
+        return 1;
+    }
+    if (layer1 == -1) {
+        layer1 = n_layer;
+    }
+    if (layer0 > layer1) {
+        LLAMA_LOG_ERROR("%s: invalid layer range: layer0 = %d, layer1 = %d\n", __func__, layer0, layer1);
+        return 1;
+    }
+
+    // figure out kv cache entry indices to import
+    std::vector<uint32_t> import_indices(p1 - p0, 0x7fffffff);
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        if (cache.cells[i].has_seq_id(seq_id) && cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
+            import_indices[cache.cells[i].pos - p0] = i;
+        }
+    }
+    for (uint32_t i = 0; i < import_indices.size(); ++i) {
+        if (import_indices[i] == 0x7fffffff) {
+            LLAMA_LOG_ERROR("%s: missing kv cache entry for token index %u\n", __func__, p0 + i);
+            return 1;
+        }
+        // LLAMA_LOG_INFO("%s: import_indices[%d] = %d\n", __func__, i, import_indices[i]);
+    }
+
+    // see also:
+    //  - llama_copy_state_data_internal
+    //  - llama_set_state_data
+    const size_t elt_size = ggml_element_size(cache.k_l[0]);
+
+    // N.B.: there's token-level, 128-chunked, permute/transpose between llama.cpp's k-cache
+    // and vllm's k-cache.
+    std::vector<uint8_t> k_permute_buffer;
+
+    // optimize: copy the v cache buffer to host memory first
+    // to avoid element-wise GPU-CPU memory access
+    std::unique_ptr<uint8_t> v_buffer_mirror = nullptr;  // use unique_ptr for auto-release
+    if (cache.v_l[0]->backend != GGML_BACKEND_CPU) {
+        v_buffer_mirror = std::unique_ptr<uint8_t>(
+            (uint8_t *) malloc((layer1 - layer0) * kv_head * n_embd_v_gqa * elt_size));
+        // the memory allocation may fail
+        if (v_buffer_mirror != nullptr) {
+            for (int il = layer0; il < layer1; ++il) {
+                ggml_backend_t backend = ggml_backend_sched_get_node_backend(ctx->sched, cache.v_l[il]);
+                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                    ggml_backend_tensor_get_async(
+                        backend, cache.v_l[il],
+                        v_buffer_mirror.get() + (il - layer0) * n_embd_v_gqa * elt_size * kv_head
+                                              + ir * elt_size * kv_head,
+                        ir * elt_size * kv_size,
+                        elt_size * kv_head);
+                }
+                ggml_backend_synchronize(backend);
+            }
+        }
+    }
+
+    size_t offset = 0;
+    for (int ip = p0; ip < p1; ++ip) {
+        // LLAMA_LOG_INFO("%s: seq_id = %d, import_indices[ip - p0] = %d\n", __func__, seq_id, import_indices[ip - p0]);
+        for (int il = layer0; il < layer1; ++il) {
+            // get k buffer and re-permute
+            size_t k_nbytes = n_embd_k_gqa * elt_size;
+            if (offset + k_nbytes > buffer_size) {
+                LLAMA_LOG_ERROR("%s: buffer overflow: offset = %zu, k_nbytes = %zu, buffer_size = %zu\n",
+                                __func__, offset, k_nbytes, buffer_size);
+                return 1;
+            }
+            const uint8_t *k_buffer = buffer + offset;
+            if (repermute_k > 1) {
+                k_permute_buffer.resize(k_nbytes);
+            }
+            // re-premute the k-cache of llama.cpp
+            if (repermute_k > 1) {
+                if (elt_size == 8) {
+                    // 8-byte double
+                    depermute_k_cache(reinterpret_cast<uint64_t *>(k_permute_buffer.data()),
+                                      reinterpret_cast<const uint64_t *>(k_buffer),
+                                      k_nbytes / 8, 2, repermute_k);
+                } else if (elt_size == 4) {
+                    // 4-byte float
+                    depermute_k_cache(reinterpret_cast<uint32_t *>(k_permute_buffer.data()),
+                                      reinterpret_cast<const uint32_t *>(k_buffer),
+                                      k_nbytes / 4, 2, repermute_k);
+                } else if (elt_size == 2) {
+                    // 2-byte half
+                    depermute_k_cache(reinterpret_cast<uint16_t *>(k_permute_buffer.data()),
+                                      reinterpret_cast<const uint16_t *>(k_buffer),
+                                      k_nbytes / 2, 2, repermute_k);
+                } else if (elt_size == 1) {
+                    depermute_k_cache(reinterpret_cast<uint8_t *>(k_permute_buffer.data()),
+                                      reinterpret_cast<const uint8_t *>(k_buffer),
+                                      k_nbytes / 1, 2, repermute_k);
+                } else {
+                    LLAMA_LOG_ERROR("%s: unsupported k-cache element size: %zu\n", __func__, elt_size);
+                    return 1;
+                }
+                // use the permuted result
+                k_buffer = k_permute_buffer.data();
+            }
+            ggml_backend_tensor_set(
+                cache.k_l[il],
+                k_buffer,
+                elt_size * n_embd_k_gqa * import_indices[ip - p0],
+                k_nbytes);
+
+            offset += k_nbytes;
+
+            // get v buffer row-by-row as v is not contiguous
+            size_t v_nbytes = n_embd_v_gqa * elt_size;
+            if (offset + v_nbytes > buffer_size) {
+                LLAMA_LOG_ERROR("%s: buffer overflow: offset = %zu, v_nbytes = %zu, buffer_size = %zu\n",
+                                __func__, offset, v_nbytes, buffer_size);
+                return 1;
+            }
+            if (v_buffer_mirror != nullptr) {
+                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                    memcpy(v_buffer_mirror.get() + (il - layer0) * n_embd_v_gqa * elt_size * kv_head
+                                                 + ir * elt_size * kv_head
+                                                 + import_indices[ip - p0] * elt_size,
+                           buffer + offset,
+                           elt_size);
+                    offset += elt_size;
+                }
+            } else {
+                ggml_backend_t backend = ggml_backend_sched_get_node_backend(ctx->sched, cache.v_l[il]);
+                for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                    ggml_backend_tensor_set_async(
+                        backend, cache.v_l[il],
+                        buffer + offset,
+                        ir * elt_size * kv_size + elt_size * import_indices[ip - p0],
+                        elt_size);
+                    offset += elt_size;
+                }
+                ggml_backend_synchronize(backend);
+            }
+        }
+    }
+
+    // copy back to device buffer as a whole
+    if (v_buffer_mirror != nullptr) {
+        for (int il = layer0; il < layer1; ++il) {
+            ggml_backend_t backend = ggml_backend_sched_get_node_backend(ctx->sched, cache.v_l[il]);
+            for (int ir = 0; ir < (int) n_embd_v_gqa; ++ir) {
+                ggml_backend_tensor_set_async(
+                    backend, cache.v_l[il],
+                    v_buffer_mirror.get() + (il - layer0) * n_embd_v_gqa * elt_size * kv_head
+                                            + ir * elt_size * kv_head,
+                    ir * elt_size * kv_size,
+                    elt_size * kv_head);
+            }
+            ggml_backend_synchronize(backend);
+        }
+    }
+
     if (offset != buffer_size) {
         LLAMA_LOG_ERROR("%s: buffer size mismatched: offset = %zu, buffer_size = %zu\n", __func__, offset, buffer_size);
         return 1;
@@ -8061,6 +8261,134 @@ static int llama_decode_internal(
     return 0;
 }
 
+// allocate kv-cache slots for the current batch.
+//
+//   - lctx:      llama context
+//   - batch:     batch to evaluate
+//
+// return 0 on success
+// return positive int on warning
+// return negative int on error
+//
+static int llama_allocate_kvcache_slots_internal(
+         llama_context & lctx,
+           llama_batch   batch) {
+    const uint32_t n_tokens = batch.n_tokens;
+
+    if (n_tokens == 0) {
+        LLAMA_LOG_ERROR("%s: n_tokens == 0", __func__);
+        return -1;
+    }
+
+    const auto & model   = lctx.model;
+    const auto & hparams = model.hparams;
+    const auto & cparams = lctx.cparams;
+
+    const auto n_batch = cparams.n_batch;
+
+    GGML_ASSERT(n_tokens <= n_batch);
+
+    int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
+    GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
+
+#ifdef GGML_USE_MPI
+    // TODO: needs fix after #3228
+    GGML_ASSERT(false && "not implemented");
+    //ggml_mpi_eval_init(lctx.ctx_mpi, &n_tokens, &n_past, &n_threads);
+#endif
+
+    GGML_ASSERT(n_threads > 0);
+
+    auto & kv_self = lctx.kv_self;
+
+    // helpers for smoother batch API transition
+    // after deprecating the llama_eval calls, these will be removed
+    std::vector<llama_pos> pos;
+
+    std::vector<int32_t>                   n_seq_id;
+    std::vector<llama_seq_id *>            seq_id_arr;
+    std::vector<std::vector<llama_seq_id>> seq_id;
+
+    if (batch.pos == nullptr) {
+        pos.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            pos[i] = batch.all_pos_0 + i*batch.all_pos_1;
+        }
+
+        batch.pos = pos.data();
+    }
+
+    if (batch.seq_id == nullptr) {
+        n_seq_id.resize(n_tokens);
+        seq_id.resize(n_tokens);
+        seq_id_arr.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            n_seq_id[i] = 1;
+            seq_id[i].resize(1);
+            seq_id[i][0] = batch.all_seq_id;
+            seq_id_arr[i] = seq_id[i].data();
+        }
+
+        batch.n_seq_id = n_seq_id.data();
+        batch.seq_id = seq_id_arr.data();
+    }
+
+    // if we have enough unused cells before the current head ->
+    //   better to start searching from the beginning of the cache, hoping to fill it
+    if (kv_self.head > kv_self.used + 2*n_tokens) {
+        kv_self.head = 0;
+    }
+
+    if (!llama_kv_cache_find_slot(kv_self, batch)) {
+        return 1;
+    }
+
+    // a heuristic, to avoid attending the full cache if it is not yet utilized
+    // after enough generations, the benefit from this heuristic disappears
+    // if we start defragmenting the cache, the benefit from this will be more important
+    kv_self.n = std::min((int32_t) cparams.n_ctx, std::max(32, GGML_PAD(llama_kv_cache_cell_max(kv_self), 32)));
+    //kv_self.n = llama_kv_cache_cell_max(kv_self);
+
+    //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
+
+    ggml_backend_sched_reset(lctx.sched);
+
+    const int64_t n_layer = hparams.n_layer;
+    ggml_backend_t backend;
+    if (lctx.cparams.offload_kqv) {
+        if (lctx.backends.size() != 2 /* GPU + CPU */) {
+            LLAMA_LOG_ERROR("%s: multiple GPUs supported is not implemented\n", __func__);
+            return -1;
+        }
+        backend = lctx.backends.front();
+    } else {
+        backend = lctx.backend_cpu;
+    }
+    for (int64_t il = 0; il < n_layer; ++il) {
+        ggml_backend_sched_set_node_backend(lctx.sched, kv_self.k_l[il], backend);
+        ggml_backend_sched_set_node_backend(lctx.sched, kv_self.v_l[il], backend);
+    }
+
+    // update the kv ring buffer
+    {
+        if (kv_self.has_shift) {
+            kv_self.has_shift = false;
+            for (uint32_t i = 0; i < kv_self.size; ++i) {
+                kv_self.cells[i].delta = 0;
+            }
+        }
+
+        kv_self.head += n_tokens;
+
+        // Ensure kv cache head points to a valid index.
+        if (kv_self.head >= kv_self.size) {
+            kv_self.head = 0;
+        }
+    }
+
+    return 0;
+}
+
 //
 // tokenizer
 //
@@ -12101,6 +12429,25 @@ int export_kv_cache_buffers(struct llama_context * ctx,
                                    repermute_k);
 }
 
+int import_kv_cache_buffers(struct llama_context * ctx,
+                            const void * buffer,
+                            size_t buffer_size,
+                            llama_seq_id seq_id,
+                            llama_pos p0, llama_pos p1,
+                            int layer0, int layer1,
+                            size_t repermute_k) {
+    const struct llama_hparams & hparams = ctx->model.hparams;
+    const uint32_t n_embd_k_gqa  = hparams.n_embd_k_gqa();
+    const uint32_t n_embd_v_gqa  = hparams.n_embd_v_gqa();
+    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_ctx = ctx->cparams.n_ctx;
+    return import_kv_cache_buffers(ctx, ctx->kv_self,
+                                   reinterpret_cast<const uint8_t *>(buffer), buffer_size,
+                                   n_embd_k_gqa, n_embd_v_gqa, n_layer, n_ctx,
+                                   seq_id, p0, p1, layer0, layer1,
+                                   repermute_k);
+}
+
 // Returns the *maximum* size of the state
 size_t llama_get_state_size(const struct llama_context * ctx) {
     // we don't know size of rng until we actually serialize it. so reserve more than enough memory for its serialized state.
@@ -12582,6 +12929,17 @@ int32_t llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
     const int ret = llama_decode_internal(*ctx, batch);
+    if (ret < 0) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_allocate_kvcache_slots(
+        struct llama_context * ctx,
+          struct llama_batch   batch) {
+    const int ret = llama_allocate_kvcache_slots_internal(*ctx, batch);
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

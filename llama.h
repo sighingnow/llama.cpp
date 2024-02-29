@@ -563,6 +563,16 @@ extern "C" {
                                           int layer0, int layer1,
                                           size_t repermute_k);
 
+    // Import the KV cache buffer for the given sequence, given token index, and given layer,
+    // from the given buffer.
+    LLAMA_API int import_kv_cache_buffers(struct llama_context * ctx,
+                                          const void * buffer,
+                                          size_t buffer_size,
+                                          llama_seq_id seq_id,
+                                          llama_pos p0, llama_pos p1,
+                                          int layer0, int layer1,
+                                          size_t repermute_k);
+
     //
     // State / sessions
     //
@@ -653,6 +663,18 @@ extern "C" {
     //   1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
     // < 0 - error
     LLAMA_API int32_t llama_decode(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
+    // Like `llama_decode`, but only allocate the kv-cache slots, without eval the model.
+    //
+    // Used for prefix cache filling on-the-fly.
+    //
+    // Positive return values does not mean a fatal error, but rather a warning.
+    //   0 - success
+    //   1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
+    // < 0 - error
+    LLAMA_API int32_t llama_allocate_kvcache_slots(
             struct llama_context * ctx,
               struct llama_batch   batch);
 
