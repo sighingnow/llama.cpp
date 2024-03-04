@@ -379,19 +379,19 @@ int main(int argc, char ** argv) {
     const int block_size = 128;
     auto manager = std::make_shared<KVStateCacheManager>(dimension, capacity, n_layers, block_size);
 
-    for (llama_seq_id seq_id = 0; seq_id < tokens_lists_size; seq_id++) {
-        std::map<int, std::pair<K_STATE, V_STATE>> kv_state;
-        // TODO: pre-allocate memory, needs to fixed after we fixing the `Query()` API in vineyard
-        for (uint32_t il = 0; il < n_layers; il++) {
-            K_STATE key_state;
-            V_STATE value_state;
-            key_state.data = malloc(k_tensor_nbytes);
-            key_state.length = k_tensor_nbytes;
-            value_state.data = malloc(v_tensor_nbytes);
-            value_state.length = v_tensor_nbytes;
-            kv_state.emplace(il, std::make_pair(key_state, value_state));
-        }
+    std::map<int, std::pair<K_STATE, V_STATE>> kv_state;
+    // TODO: pre-allocate memory, needs to fixed after we fixing the `Query()` API in vineyard
+    for (uint32_t il = 0; il < n_layers; il++) {
+        K_STATE key_state;
+        V_STATE value_state;
+        key_state.data = malloc(k_tensor_nbytes);
+        key_state.length = k_tensor_nbytes;
+        value_state.data = malloc(v_tensor_nbytes);
+        value_state.length = v_tensor_nbytes;
+        kv_state.emplace(il, std::make_pair(key_state, value_state));
+    }
 
+    for (llama_seq_id seq_id = 0; seq_id < tokens_lists_size; seq_id++) {
         llama_pos n_prefill = 0;
         std::vector<llama_token> prefix_tokens;
         uint64_t offset = 0;
@@ -416,6 +416,11 @@ int main(int argc, char ** argv) {
             // move on
             prefix_tokens.push_back(tokens_lists[seq_id][n_prefill]);
             n_prefill++;
+
+            // early stop: leave the last token for the first decoding runs
+            if (n_prefill + 1 >= static_cast<llama_pos>(tokens_lists[seq_id].size())) {
+                break;
+            }
         } while (true);
         uint64_t buffer_nbytes = prefix_tokens.size() * n_layers * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
         if (offset != buffer_nbytes) {
@@ -502,25 +507,41 @@ int main(int argc, char ** argv) {
             0, n_layers,
             seq_id, prefix_caches);
 
+        LOG_TEE("%s: updating kv cache in vineyard: %u -> %u\n", __func__, token_start_pos, token_stop_pos);
         // updates the remaining kv-cache into vineyard
+        std::map<int, std::pair<K_STATE, V_STATE>> new_kv_state;
         offset = 0;
         for (llama_pos i = token_start_pos; i < token_stop_pos; ++i) {
-            // compose `kv_state`
+            // compose `new_kv_state`
             for (uint32_t il = 0; il < n_layers; il++) {
-                kv_state[il].first.data = prefix_caches.data() + offset;
+                new_kv_state[il].first.data = prefix_caches.data() + offset;
                 offset += k_tensor_nbytes;
-                kv_state[il].first.length = k_tensor_nbytes;
-                kv_state[il].second.data = prefix_caches.data() + offset;
+                new_kv_state[il].first.length = k_tensor_nbytes;
+                new_kv_state[il].second.data = prefix_caches.data() + offset;
                 offset += v_tensor_nbytes;
-                kv_state[il].second.length = v_tensor_nbytes;
+                new_kv_state[il].second.length = v_tensor_nbytes;
             }
-            manager->Update(prefix_tokens, tokens_lists[seq_id][i], kv_state);
+            manager->Update(prefix_tokens, tokens_lists[seq_id][i], new_kv_state);
             // move on
             prefix_tokens.push_back(tokens_lists[seq_id][i]);
         }
 
         // not used any more
         llama_kv_cache_seq_rm(ctx, seq_id, 0, n_prefill);
+    }
+
+    // cleanup `kv_state`: free the memory
+    for (auto &kv : kv_state) {
+        if (kv.second.first.data) {
+            free(kv.second.first.data);
+            kv.second.first.data = nullptr;
+            kv.second.first.length = 0;
+        }
+        if (kv.second.second.data) {
+            free(kv.second.second.data);
+            kv.second.second.data = nullptr;
+            kv.second.second.length = 0;
+        }
     }
 
     llama_print_timings(ctx);
