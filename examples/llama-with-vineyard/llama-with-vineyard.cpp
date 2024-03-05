@@ -249,6 +249,7 @@ static inline std::string escape(const std::string &str) {
 
 int main(int argc, char ** argv) {
     gpt_params params;
+    int with_vineyard = 0;
 
     if (argc < 4 || argv[1][0] == '-') {
         printf("usage: %s MODEL_PATH [PROMPT OR PROMPT_FILE] [N_GPU_LAYERS] [N_PREDICT] [N_BATCH]\n" , argv[0]);
@@ -264,15 +265,19 @@ int main(int argc, char ** argv) {
     }
 
     if (argc >= 4) {
-        params.n_gpu_layers = std::atoi(argv[3]);
+        with_vineyard = std::atoi(argv[3]);
     }
 
     if (argc >= 5) {
-        params.n_predict = std::atoi(argv[4]);
+        params.n_gpu_layers = std::atoi(argv[4]);
     }
 
     if (argc >= 6) {
-        params.n_batch = std::atoi(argv[5]);
+        params.n_predict = std::atoi(argv[5]);
+    }
+
+    if (argc >= 7) {
+        params.n_batch = std::atoi(argv[6]);
     }
 
     if (params.prompt.empty()) {
@@ -343,6 +348,7 @@ int main(int argc, char ** argv) {
     int max_token_list_size = tokenize(ctx, prompts, tokens_lists);
     llama_seq_id tokens_lists_size = tokens_lists.size();
 
+    LOG_TEE("%s: max_token_list_size = %d\n", __func__, max_token_list_size);
     // create a llama_batch with size 512
     // we use this object to submit token data for decoding
     llama_batch batch = llama_batch_init(params.n_batch, 0, prompts.size());
@@ -373,91 +379,74 @@ int main(int argc, char ** argv) {
     }
 
     // init vineyard kv cache
-    // TODO: we shouldn't assume the `double` type.
-    const int dimension = k_tensor_nbytes / sizeof(double);
+    const int tensor_bytes = k_tensor_nbytes;
     const int capacity = 2048;
     const int block_size = 128;
-    auto manager = std::make_shared<KVStateCacheManager>(dimension, capacity, n_layers, block_size);
 
-    std::map<int, std::pair<K_STATE, V_STATE>> kv_state;
-    // TODO: pre-allocate memory, needs to fixed after we fixing the `Query()` API in vineyard
-    for (uint32_t il = 0; il < n_layers; il++) {
-        K_STATE key_state;
-        V_STATE value_state;
-        key_state.data = malloc(k_tensor_nbytes);
-        key_state.length = k_tensor_nbytes;
-        value_state.data = malloc(v_tensor_nbytes);
-        value_state.length = v_tensor_nbytes;
-        kv_state.emplace(il, std::make_pair(key_state, value_state));
+    std::shared_ptr<KVStateCacheManager> manager;
+    if (with_vineyard != 0){
+        manager = std::make_shared<KVStateCacheManager>(tensor_bytes, capacity, n_layers, block_size);
     }
+    std::vector<std::map<int, std::pair<LLMKV, LLMKV>>> kv_state_list;
 
     for (llama_seq_id seq_id = 0; seq_id < tokens_lists_size; seq_id++) {
+        kv_state_list.clear();
         llama_pos n_prefill = 0;
         std::vector<llama_token> prefix_tokens;
         uint64_t offset = 0;
+        if (with_vineyard != 0){
+            manager->Query(tokens_lists[seq_id], kv_state_list);
+            n_prefill = kv_state_list.size();
 
-        // TODO: use `Query(token_list, kv_cache_list)` once it supports partial match
-        do {
-            int r = manager->Query(prefix_tokens, tokens_lists[seq_id][n_prefill], kv_state);
-            // mismatched
-            if (r != 0) {
-                break;
-            }
             // copy the kv-cache to the buffer, as `import_kv_cache_buffers` requires
             // a continuous buffer currently.
-            for (uint32_t il = 0; il < n_layers; il++) {
-                K_STATE key_state = kv_state[il].first;
-                V_STATE value_state = kv_state[il].second;
-                memcpy(prefix_caches.data() + offset, key_state.data, k_tensor_nbytes);
-                offset += k_tensor_nbytes;
-                memcpy(prefix_caches.data() + offset, value_state.data, v_tensor_nbytes);
-                offset += v_tensor_nbytes;
+            for (llama_pos prefill_pos = 0; prefill_pos < n_prefill; ++prefill_pos){
+                for (uint32_t il = 0; il < n_layers; il++) {
+                    LLMKV key_state = kv_state_list[prefill_pos][il].first;
+                    LLMKV value_state = kv_state_list[prefill_pos][il].second;
+                    memcpy(prefix_caches.data() + offset, key_state.data, k_tensor_nbytes);
+                    offset += k_tensor_nbytes;
+                    memcpy(prefix_caches.data() + offset, value_state.data, v_tensor_nbytes);
+                    offset += v_tensor_nbytes;
+                }
             }
-            // move on
-            prefix_tokens.push_back(tokens_lists[seq_id][n_prefill]);
-            n_prefill++;
 
-            // early stop: leave the last token for the first decoding runs
-            if (n_prefill + 1 >= static_cast<llama_pos>(tokens_lists[seq_id].size())) {
-                break;
+            uint64_t buffer_nbytes = n_prefill * n_layers * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
+            if (offset != buffer_nbytes) {
+                LOG_TEE("%s: inconsistent: offset = %zu, buffer_nbytes = %zu\n",
+                        __func__, offset, buffer_nbytes);
+                return 1;
             }
-        } while (true);
-        uint64_t buffer_nbytes = prefix_tokens.size() * n_layers * static_cast<uint64_t>(k_tensor_nbytes + v_tensor_nbytes);
-        if (offset != buffer_nbytes) {
-            LOG_TEE("%s: inconsistent: offset = %zu, buffer_nbytes = %zu\n",
-                    __func__, offset, buffer_nbytes);
-            return 1;
-        }
-        LOG_TEE("%s: matched %u prefix tokens from vineyard\n", __func__, n_prefill);
+            LOG_TEE("%s: matched %u prefix tokens from vineyard\n", __func__, n_prefill);
 
-        // import kv-cache
-        if (n_prefill > 0) {
-            llama_batch_clear(batch);
+            // import kv-cache
+            if (n_prefill > 0) {
+                llama_batch_clear(batch);
 
-            batch.token = batch_tokens;
-            batch.embd = nullptr;
+                batch.token = batch_tokens;
+                batch.embd = nullptr;
 
-            for (llama_pos i = 0; i < n_prefill; i++) {
-                llama_batch_add(batch,
-                                tokens_lists[seq_id][i],
-                                i,
-                                { seq_id },
-                                false);
+                for (llama_pos i = 0; i < n_prefill; i++) {
+                    llama_batch_add(batch,
+                                    tokens_lists[seq_id][i],
+                                    i,
+                                    { seq_id },
+                                    false);
+                }
+                if (llama_allocate_kvcache_slots(ctx, batch) != 0) {
+                    LOG_TEE("%s: llama_allocate_kvcache_slots() failed\n", __func__);
+                    return 1;
+                }
             }
-            if (llama_allocate_kvcache_slots(ctx, batch) != 0) {
-                LOG_TEE("%s: llama_allocate_kvcache_slots() failed\n", __func__);
+            if (import_kv_cache_buffers(
+                ctx_params, ctx, model,
+                0, n_prefill,
+                0, n_layers - params.n_skip_layers,
+                seq_id, prefix_caches) != 0) {
+                LOG_TEE("%s: import_kv_cache_buffers() failed\n", __func__);
                 return 1;
             }
         }
-        if (import_kv_cache_buffers(
-            ctx_params, ctx, model,
-            0, n_prefill,
-            0, n_layers - params.n_skip_layers,
-            seq_id, prefix_caches) != 0) {
-            LOG_TEE("%s: import_kv_cache_buffers() failed\n", __func__);
-            return 1;
-        }
-
         // reset the context
         out_tokens.clear();
         output_content.clear();
@@ -497,51 +486,38 @@ int main(int argc, char ** argv) {
             start_pos = stop_pos;
             stop_pos = start_pos + 1;
         }
+        if (with_vineyard != 0){
+            // export kv-cache
+            llama_pos token_start_pos = n_prefill;
+            llama_pos token_stop_pos = tokens_lists[seq_id].size();
+            export_kv_cache_buffers(
+                ctx_params, ctx, model,
+                token_start_pos, token_stop_pos,
+                0, n_layers,
+                seq_id, prefix_caches);
 
-        // export kv-cache
-        llama_pos token_start_pos = n_prefill;
-        llama_pos token_stop_pos = tokens_lists[seq_id].size();
-        export_kv_cache_buffers(
-            ctx_params, ctx, model,
-            token_start_pos, token_stop_pos,
-            0, n_layers,
-            seq_id, prefix_caches);
-
-        LOG_TEE("%s: updating kv cache in vineyard: %u -> %u\n", __func__, token_start_pos, token_stop_pos);
-        // updates the remaining kv-cache into vineyard
-        std::map<int, std::pair<K_STATE, V_STATE>> new_kv_state;
-        offset = 0;
-        for (llama_pos i = token_start_pos; i < token_stop_pos; ++i) {
-            // compose `new_kv_state`
-            for (uint32_t il = 0; il < n_layers; il++) {
-                new_kv_state[il].first.data = prefix_caches.data() + offset;
-                offset += k_tensor_nbytes;
-                new_kv_state[il].first.length = k_tensor_nbytes;
-                new_kv_state[il].second.data = prefix_caches.data() + offset;
-                offset += v_tensor_nbytes;
-                new_kv_state[il].second.length = v_tensor_nbytes;
+            LOG_TEE("%s: updating kv cache in vineyard: %u -> %u\n", __func__, token_start_pos, token_stop_pos);
+            // updates the remaining kv-cache into vineyard
+            offset = 0;
+            for (llama_pos i = token_start_pos; i < token_stop_pos; ++i) {
+                std::map<int, std::pair<LLMKV, LLMKV>> new_kv_state;
+                // compose `new_kv_state`
+                for (uint32_t il = 0; il < n_layers; il++) {
+                    new_kv_state[il].first.data = prefix_caches.data() + offset;
+                    offset += k_tensor_nbytes;
+                    new_kv_state[il].first.length = k_tensor_nbytes;
+                    new_kv_state[il].second.data = prefix_caches.data() + offset;
+                    offset += v_tensor_nbytes;
+                    new_kv_state[il].second.length = v_tensor_nbytes;
+                }
+                manager->Update(prefix_tokens, tokens_lists[seq_id][i], new_kv_state);
+                // move on
+                prefix_tokens.push_back(tokens_lists[seq_id][i]);
             }
-            manager->Update(prefix_tokens, tokens_lists[seq_id][i], new_kv_state);
-            // move on
-            prefix_tokens.push_back(tokens_lists[seq_id][i]);
+            LOG_TEE("%s: updated kv cache in vineyard: %u -> %u\n", __func__, token_start_pos, token_stop_pos);
         }
-
         // not used any more
         llama_kv_cache_seq_rm(ctx, seq_id, 0, n_prefill);
-    }
-
-    // cleanup `kv_state`: free the memory
-    for (auto &kv : kv_state) {
-        if (kv.second.first.data) {
-            free(kv.second.first.data);
-            kv.second.first.data = nullptr;
-            kv.second.first.length = 0;
-        }
-        if (kv.second.second.data) {
-            free(kv.second.second.data);
-            kv.second.second.data = nullptr;
-            kv.second.second.length = 0;
-        }
     }
 
     llama_print_timings(ctx);

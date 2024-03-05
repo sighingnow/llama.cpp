@@ -1,2 +1,2 @@
-Hello, My name is Jack#
-Hello, My name is Jack, I am 20 years old#
+Hello, Why the following code does not work? "import os import sys import time import random import string name = input("Enter your name: ") age = input("Enter your age: ") job = input("Enter your job: ") print("Hello, My name is " + name + ", I am " + age + " years old, I am a " + job)"#
+Hello, Why the following code does not work? "import os import sys import time import random import string name = input("Enter your name: ") age = input("Enter your age: ") job = input("Enter your job: ") print("Hello, My name is " + name + ", I am " + age + " years old, I am a " + job)", I'm using python 3.10#
