@@ -391,13 +391,14 @@ int main(int argc, char ** argv) {
     for (llama_seq_id seq_id = 0; seq_id < tokens_lists_size; seq_id++) {
         kv_state_list.clear();
         llama_pos n_prefill = 0;
-        std::vector<llama_token> prefix_tokens;
         uint64_t offset = 0;
         if (with_vineyard){
             manager->Query(tokens_lists[seq_id], kv_state_list);
         }
         // early stop: leave the last token for the first decoding runs
         n_prefill = std::min(kv_state_list.size(), tokens_lists[seq_id].size() - 1);
+        std::vector<llama_token> prefix_tokens(tokens_lists[seq_id].begin(),
+                                               tokens_lists[seq_id].begin() + n_prefill);
 
         // copy the kv-cache to the buffer, as `import_kv_cache_buffers` requires
         // a continuous buffer currently.
